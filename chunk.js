@@ -3,7 +3,7 @@
 
 var SUPABASE_URL = "https://dnbqgdjdalzvbqvagmmz.supabase.co/rest/v1/";
 var SUPABASE_ANON_KEY = "sb_publishable_eP8Po7tli12Fkuoue2UKsg_Vm2vZ9Ok";
-var JSON_URL = "database_827_383_294_103_759_927_953.json";
+var JSON_URL = "https://api.jsonstorage.net/v1/json/e6114a8f-836f-4c95-bbc8-9c30e117b36e/50faec35-6cd6-432e-9b6c-0711fbf887d7?apiKey=%524ceb00-caea-4480-82c4-b1d894c818bc%";
 var REPORT_ENDPOINT = "https://formsubmit.co/ajax/mekonetwork@gmail.com";
 var HASH_SHARE_LINKS = true;
 var USERS_KEY = 'meko-registered-users';
@@ -807,10 +807,7 @@ launchReels(orderVideosByRecommendation(videoPosts), 0);
 
 function openReelsAt(postId, resumeTime){
 var clicked = videoPosts.find(function(p){ return p.id === postId; });
-if (!clicked){
-  console.log("Video Not Found")
-  return;
-}
+
 var rest = orderVideosByRecommendation(videoPosts.filter(function(p){ return p.id !== postId; }));
 document.querySelectorAll('.fsx-feed-video-wrap video').forEach(function(v){ v.pause(); });
 launchReels([clicked].concat(rest), resumeTime || 0);
@@ -833,8 +830,8 @@ document.body.style.overflow = '';
 document.querySelectorAll('.fsx-reel-media-wrap video').forEach(function(v){ 
   v.pause(); 
 });
-//setActiveNav('home');
-location.reload();
+setActiveNav('home');
+
 if(lastFeedVideo){
   lastFeedVideo.currentTime = lastFeedTime;
   lastFeedVideo.muted = isMuted;
