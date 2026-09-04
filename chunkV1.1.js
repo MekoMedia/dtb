@@ -9,6 +9,7 @@ var HASH_SHARE_LINKS = true;
 var USERS_KEY = 'meko-registered-users';
 var CURRENT_USER_KEY = 'meko-current-user';
 var POSTS_PER_PAGE = 6;
+var SEARCH_DEBOUNCE_MS = 180;
 
 var currentUser = null;
 var DATABASEPOSTS = [];
@@ -28,13 +29,29 @@ var reelRenderedIdx = new Set();
 var reelIconTimers = {};
 var currentReelIndex = 0;
 var watchedThisSession = new Set();
+var recentlyShownVideos = new Set(); // prevents the same clip from repeating too soon
 var cpType = 'text';
 var lastFeedVideo = null;
 var lastFeedTime = 0;
 var feedObserver = null;
 var feedVideoObserver = null;
+var currentView = 'home';
+var currentBrowseTopic = null;
+
+// ---- fast search caches (built once, updated incrementally — keeps search snappy at 9k+ posts) ----
+var profilesCache = [];   // [{name, username, postsCount, totalLikes}]
+var topicsCache = [];     // [{name:'#topic', topic, postsCount}]
 
 var $ = function(id){ return document.getElementById(id); };
+
+function debounce(fn, wait){
+var t;
+return function(){
+  var args = arguments, ctx = this;
+  clearTimeout(t);
+  t = setTimeout(function(){ fn.apply(ctx, args); }, wait);
+};
+}
 
 function initSupabase(){
 if (window.supabase && SUPABASE_URL && SUPABASE_URL.indexOf('YOUR_') !== 0){
@@ -72,27 +89,49 @@ if (users[currentUser.username]){
 }
 }
 
+/* ===================== AUTH — non-blocking popup ===================== */
+// The app is always visible. Guests can browse everything; the popup only
+// appears on load (dismissible) or when a guest tries to Like / Post / Report / view Profile.
+
 function checkAuth(){
 var saved = localStorage.getItem(CURRENT_USER_KEY);
 if (saved){
   try {
     var parsed = JSON.parse(saved);
     currentUser = Object.assign({}, parsed, { likedPosts: new Set(parsed.likedPosts||[]), followedTopics: new Set(parsed.followedTopics||[]), isGuest: false });
-    hideAuth(); updateUserUI(); return;
+    updateUserUI();
+    return;
   } catch(e){ localStorage.removeItem(CURRENT_USER_KEY); }
 }
 currentUser = { name:'Guest', username:'guest', email:'', likedPosts:new Set(), searchHistory:[], followedTopics:new Set(), isGuest:true };
-showAuth(); updateUserUI();
+updateUserUI();
+openAuthPopup('Log in or sign up to like, post, and report — or continue as a guest.');
 }
 
-function showAuth(){ $('fsxAuthModal').classList.add('active'); $('fsxApp').classList.add('hidden'); }
-function hideAuth(){ $('fsxAuthModal').classList.remove('active'); $('fsxApp').classList.remove('hidden'); }
+function openAuthPopup(msg){
+if (msg) $('fsxAuthSub').textContent = msg;
+$('fsxAuthModal').classList.add('active');
+}
+function closeAuthPopup(){ $('fsxAuthModal').classList.remove('active'); }
+
+// Central gate used by every action that requires an account.
+function requireAuth(msg){
+if (!currentUser || currentUser.isGuest){ openAuthPopup(msg || 'Log in or sign up to continue.'); return false; }
+return true;
+}
+
+$('fsxAuthClose').addEventListener('click', closeAuthPopup);
+$('fsxGuestBtn').addEventListener('click', closeAuthPopup);
+$('fsxGuestBtn2').addEventListener('click', closeAuthPopup);
+$('fsxAuthModal').addEventListener('click', function(e){ if (e.target === this) closeAuthPopup(); });
 
 function updateUserUI(){
 if (!currentUser) return;
 var avatar = 'https://ui-avatars.com/api/?name=' + encodeURIComponent(currentUser.name) + '&background=2dd4bf&color=06131a&bold=true';
 $('fsxUserAvatarImg').src = avatar;
 $('fsxTriggerAvatar').src = avatar;
+$('fsxLoginLink').classList.toggle('hidden', !currentUser.isGuest);
+$('fsxLogoutLink').classList.toggle('hidden', !!currentUser.isGuest);
 }
 
 $('fsxCreateAccountBtn').addEventListener('click', function(){ document.querySelector('.fsx-auth-tab[data-tab="signup"]').click(); });
@@ -119,7 +158,8 @@ if (!users[username]){ err.textContent = 'Account not found. Please sign up firs
 if (users[username].password !== password){ err.textContent = 'Wrong password. Please try again.'; err.style.display='block'; return; }
 var userData = users[username];
 currentUser = { name:userData.name, username:username, email:userData.email, likedPosts:new Set(userData.likedPosts||[]), searchHistory:userData.searchHistory||[], followedTopics:new Set(userData.followedTopics||[]), isGuest:false };
-saveCurrentUser(); hideAuth(); updateUserUI(); loadSearchHistory(); loadTrendingTopics(); loadSuggestedProfiles();
+saveCurrentUser(); closeAuthPopup(); updateUserUI();
+loadSearchHistory(); loadTrendingTopics(); loadSuggestedProfiles(); resetHomeFeed();
 $('fsxLoginForm').reset();
 });
 
@@ -138,22 +178,22 @@ if (isUsernameTaken(username)){ $('fsxUsernameError').textContent = 'This userna
 var userData = { name:name, email:email, password:password, likedPosts:[], searchHistory:[], followedTopics:[], createdAt:new Date().toISOString() };
 saveRegisteredUser(username, userData);
 currentUser = { name:name, username:username, email:email, likedPosts:new Set(), searchHistory:[], followedTopics:new Set(), isGuest:false };
-saveCurrentUser(); hideAuth(); updateUserUI();
+saveCurrentUser(); closeAuthPopup(); updateUserUI(); resetHomeFeed();
 $('fsxSignupForm').reset();
 document.querySelector('.fsx-auth-tab[data-tab="login"]').click();
 });
 
 function handleLogout(){
 localStorage.removeItem(CURRENT_USER_KEY);
-showAuth();
-$('fsxPostsFeed').innerHTML = '';
-displayedPosts.clear(); hasMorePosts = true;
 currentUser = { name:'Guest', username:'guest', email:'', likedPosts:new Set(), searchHistory:[], followedTopics:new Set(), isGuest:true };
 updateUserUI();
+resetHomeFeed();
+loadSearchHistory();
 }
 
 $('fsxLogoutLink').addEventListener('click', function(e){ e.preventDefault(); handleLogout(); });
 $('fsxMobileLogout').addEventListener('click', handleLogout);
+$('fsxLoginLink').addEventListener('click', function(e){ e.preventDefault(); $('fsxUserDropdown').classList.remove('active'); openAuthPopup(); });
 
 $('fsxThemeBtn').addEventListener('click', function(){ document.body.classList.toggle('fsx-light'); });
 $('fsxMenuToggle').addEventListener('click', function(){ $('fsxUserDropdown').classList.toggle('active'); });
@@ -168,13 +208,29 @@ $('fsxMobileMenuToggle').addEventListener('click', function(){ $('fsxMobileMenuO
 $('fsxCloseMobileMenu').addEventListener('click', function(){ $('fsxMobileMenuOverlay').classList.remove('active'); });
 $('fsxMobileMenuOverlay').addEventListener('click', function(e){ if (e.target === this) this.classList.remove('active'); });
 
+/* ===================== NAVIGATION / VIEWS ===================== */
+
+function switchView(name){
+currentView = name;
+setActiveNav(name);
+if (name === 'browse'){
+  $('fsxFeedView').classList.add('hidden');
+  $('fsxBrowseView').classList.remove('hidden');
+  if (!$('fsxBrowseSearchInput').value.trim()) renderBrowseDefault();
+} else {
+  $('fsxBrowseView').classList.add('hidden');
+  $('fsxFeedView').classList.remove('hidden');
+}
+}
+
 document.querySelectorAll('[data-nav]').forEach(function(btn){
 btn.addEventListener('click', function(){
   var nav = btn.dataset.nav;
   if (btn.hasAttribute('data-close-mobile')) $('fsxMobileMenuOverlay').classList.remove('active');
   if (nav === 'videos'){ openReels(); return; }
   if (nav === 'profile'){ showOwnProfile(); return; }
-  setActiveNav('home');
+  if (nav === 'browse'){ switchView('browse'); return; }
+  switchView('home');
 });
 });
 
@@ -193,58 +249,99 @@ if (reelIcon) reelIcon.className = 'fas ' + (isMuted ? 'fa-volume-mute' : 'fa-vo
 
 $('fsxReelMute').addEventListener('click', function(){ setGlobalMute(!isMuted); });
 
-$('fsxSearchInput').addEventListener('input', function(){
-var query = this.value.trim().toLowerCase();
-if (!query){ $('fsxSearchResults').style.display = 'none'; return; }
-renderSearchResults(searchProfiles(query), searchTopics(query), searchPosts(query), query);
-});
+/* ===================== FAST SEARCH ===================== */
+// Caches are built once when posts load, then updated incrementally on new posts —
+// so search stays instant even with 9k+ posts. Header + Browse inputs are debounced.
 
-function searchProfiles(query){
+function buildSearchCaches(){
 var seen = new Map();
 DATABASEPOSTS.forEach(function(post){
-  if (!seen.has(post.username)){
-    var userPosts = DATABASEPOSTS.filter(function(p){ return p.username === post.username; });
-    var totalLikes = userPosts.reduce(function(s,p){ return s + (p.likes||0); }, 0);
-    seen.set(post.username, { name: post.name, username: post.username, postsCount: userPosts.length, totalLikes: totalLikes });
-  }
+  post._lc = ((post.name||'')+' '+(post.username||'')+' '+(post.content||'')+' '+(post.topic||'')).toLowerCase();
+  if (!seen.has(post.username)) seen.set(post.username, { name: post.name, username: post.username, postsCount: 0, totalLikes: 0 });
+  var u = seen.get(post.username); u.postsCount++; u.totalLikes += (post.likes||0);
 });
-return Array.from(seen.values()).filter(function(u){ return u.name.toLowerCase().includes(query) || u.username.toLowerCase().includes(query); });
+profilesCache = Array.from(seen.values());
+var topics = {};
+DATABASEPOSTS.forEach(function(p){ if (p.topic) topics[p.topic] = (topics[p.topic]||0)+1; });
+topicsCache = Object.entries(topics).map(function(e){ return { name:'#'+e[0], topic:e[0], postsCount:e[1] }; }).sort(function(a,b){ return b.postsCount-a.postsCount; });
+}
+
+function addPostToCaches(post){
+post._lc = ((post.name||'')+' '+(post.username||'')+' '+(post.content||'')+' '+(post.topic||'')).toLowerCase();
+var existing = profilesCache.find(function(u){ return u.username === post.username; });
+if (existing){ existing.postsCount++; existing.totalLikes += (post.likes||0); }
+else profilesCache.push({ name:post.name, username:post.username, postsCount:1, totalLikes:post.likes||0 });
+if (post.topic){
+  var t = topicsCache.find(function(x){ return x.topic === post.topic; });
+  if (t) t.postsCount++;
+  else topicsCache.push({ name:'#'+post.topic, topic:post.topic, postsCount:1 });
+  topicsCache.sort(function(a,b){ return b.postsCount-a.postsCount; });
+}
+}
+
+function searchProfiles(query){
+return profilesCache.filter(function(u){ return u.name.toLowerCase().indexOf(query) > -1 || u.username.toLowerCase().indexOf(query) > -1; });
 }
 
 function searchTopics(query){
-var topics = {};
-DATABASEPOSTS.forEach(function(post){ if (post.topic && post.topic.toLowerCase().includes(query)) topics[post.topic] = (topics[post.topic]||0)+1; });
-return Object.entries(topics).map(function(e){ return { name:'#'+e[0], topic:e[0], postsCount:e[1] }; }).sort(function(a,b){ return b.postsCount-a.postsCount; });
+return topicsCache.filter(function(t){ return t.topic.toLowerCase().indexOf(query) > -1; });
+}
+
+// Early-exit scan over the pre-lowercased text — fast even across thousands of posts.
+function searchPostsRaw(query, limit){
+var out = [];
+for (var i=0; i<allPosts.length; i++){
+  var post = allPosts[i];
+  if (post._lc && post._lc.indexOf(query) > -1){
+    out.push(post);
+    if (out.length >= limit) break;
+  }
+}
+return out;
 }
 
 function searchPosts(query){
-return allPosts.filter(function(post){ return (post.content && post.content.toLowerCase().includes(query)) || (post.topic && post.topic.toLowerCase().includes(query)); })
-  .map(function(post){ return { name:post.name, username:post.username, content: post.content ? post.content.substring(0,100)+(post.content.length>100?'...':'') : '', postId:post.id }; })
-  .slice(0,5);
+return searchPostsRaw(query, 5).map(function(post){
+  return { name:post.name, username:post.username, content: post.content ? post.content.substring(0,100)+(post.content.length>100?'...':'') : '', postId:post.id };
+});
 }
+
+var runHeaderSearch = debounce(function(query){
+if (!query){ $('fsxSearchResults').style.display = 'none'; return; }
+renderSearchResults(searchProfiles(query).slice(0,5), searchTopics(query).slice(0,5), searchPosts(query), query);
+}, SEARCH_DEBOUNCE_MS);
+
+$('fsxSearchInput').addEventListener('input', function(){
+runHeaderSearch(this.value.trim().toLowerCase());
+});
 
 function renderSearchResults(profiles, topics, posts, query){
 var wrap = $('fsxSearchResults'); wrap.innerHTML = ''; var any = false;
 if (profiles.length){ any = true; wrap.appendChild(sectionHeader('Profiles'));
-  profiles.slice(0,5).forEach(function(p){
+  profiles.forEach(function(p){
     var item = resultItem('<img src="https://ui-avatars.com/api/?name='+encodeURIComponent(p.name)+'&background=1e3a8a&color=fff">', p.name, '@'+p.username+' · '+p.postsCount+' posts');
     item.addEventListener('click', function(){ showUserProfile(p.username, p.name); addToSearchHistory(p.username, p.name, 'profile'); closeSearch(); });
     wrap.appendChild(item);
   });
 }
 if (topics.length){ any = true; wrap.appendChild(sectionHeader('Topics'));
-  topics.slice(0,5).forEach(function(t){
-    var item = resultItem('<div style="width:36px;height:36px;border-radius:50%;background:var(--surface-2);display:flex;align-items:center;justify-content:center;color:var(--teal);"><i class="fas fa-hashtag"></i></div>', t.name, t.postsCount+' posts');
+  topics.forEach(function(t){
+    var item = resultItem('<div style="width:36px;height:36px;border-radius:50%;background:var(--surface-3);display:flex;align-items:center;justify-content:center;color:var(--ig-blue);"><i class="fas fa-hashtag"></i></div>', t.name, t.postsCount+' posts');
     item.addEventListener('click', function(){ filterPostsByTopic(t.topic); addToSearchHistory(t.topic, t.name, 'topic'); closeSearch(); });
     wrap.appendChild(item);
   });
 }
 if (posts.length){ any = true; wrap.appendChild(sectionHeader('Posts'));
   posts.forEach(function(p){
-    var item = resultItem('<div style="width:36px;height:36px;border-radius:50%;background:var(--surface-2);display:flex;align-items:center;justify-content:center;color:var(--indigo);"><i class="fas fa-file-alt"></i></div>', p.name, p.content || ('@'+p.username));
+    var item = resultItem('<div style="width:36px;height:36px;border-radius:50%;background:var(--surface-3);display:flex;align-items:center;justify-content:center;color:var(--indigo);"><i class="fas fa-file-alt"></i></div>', p.name, p.content || ('@'+p.username));
     item.addEventListener('click', function(){ scrollToPost(p.postId); addToSearchHistory(p.username, 'Post by '+p.name, 'post'); closeSearch(); });
     wrap.appendChild(item);
   });
+}
+if (any){
+  var more = document.createElement('div'); more.className = 'fsx-search-more'; more.textContent = 'See all results in Browse';
+  more.addEventListener('click', function(){ closeSearch(); switchView('browse'); $('fsxBrowseSearchInput').value = query; renderBrowseSearchResults(query); });
+  wrap.appendChild(more);
 }
 if (!any) wrap.innerHTML = '<div style="text-align:center;padding:1.5rem;color:var(--text-mute);"><i class="fas fa-search" style="font-size:1.4rem;display:block;margin-bottom:0.5rem;"></i>No results for "'+escapeHtml(query)+'"</div>';
 wrap.style.display = 'block';
@@ -253,7 +350,19 @@ wrap.style.display = 'block';
 function sectionHeader(t){ var d = document.createElement('div'); d.className = 'fsx-search-section-header'; d.textContent = t; return d; }
 function resultItem(imgHtml, title, sub){ var d = document.createElement('div'); d.className = 'fsx-search-result-item'; d.innerHTML = imgHtml + '<div><h4>'+escapeHtml(title)+'</h4><span>'+escapeHtml(sub)+'</span></div>'; return d; }
 function closeSearch(){ $('fsxSearchInput').value = ''; $('fsxSearchResults').style.display = 'none'; }
-function scrollToPost(postId){ var el = document.querySelector('[data-post-id="'+postId+'"]'); if (el) el.scrollIntoView({ behavior:'smooth', block:'center' }); }
+
+function scrollToPost(postId){
+var el = document.querySelector('[data-post-id="'+postId+'"]');
+if (el){
+  el.scrollIntoView({ behavior:'smooth', block:'center' });
+  el.style.outline = '2px solid var(--ig-blue)';
+  setTimeout(function(){ el.style.outline = ''; }, 1200);
+  return;
+}
+// Not currently rendered in the feed (common with 9k+ posts) — open it directly instead.
+var post = DATABASEPOSTS.find(function(p){ return p.id === postId; });
+if (post){ if (isVideoEligible(post)) openReelsAt(postId, 0); else showSharedPostModal(post); }
+}
 
 function addToSearchHistory(identifier, name, type){
 if (!currentUser || currentUser.isGuest) return;
@@ -266,7 +375,10 @@ saveCurrentUser(); loadSearchHistory();
 
 function loadSearchHistory(){
 var wrap = $('fsxSearchHistory'); if (!wrap) return; wrap.innerHTML = '';
-if (!currentUser || !currentUser.searchHistory) return;
+if (!currentUser || !currentUser.searchHistory || currentUser.isGuest){
+  if (currentUser && currentUser.isGuest) wrap.innerHTML = '<div style="font-size:0.78rem;color:var(--text-mute);">Log in to save your search history.</div>';
+  return;
+}
 currentUser.searchHistory.forEach(function(item){
   var icon = item.type==='profile'?'user':item.type==='topic'?'hashtag':'file-alt';
   var d = document.createElement('div'); d.className = 'fsx-history-item';
@@ -279,6 +391,114 @@ currentUser.searchHistory.forEach(function(item){
   wrap.appendChild(d);
 });
 }
+
+/* ===================== BROWSE / EXPLORE TAB ===================== */
+
+function renderBrowseChips(activeTopic){
+var wrap = $('fsxBrowseChips'); wrap.innerHTML = '';
+var allChip = document.createElement('div');
+allChip.className = 'fsx-chip' + (!activeTopic ? ' active' : '');
+allChip.textContent = 'All';
+allChip.addEventListener('click', function(){ currentBrowseTopic = null; $('fsxBrowseSearchInput').value = ''; renderBrowseDefault(); });
+wrap.appendChild(allChip);
+topicsCache.slice(0,12).forEach(function(t){
+  var chip = document.createElement('div');
+  chip.className = 'fsx-chip' + (activeTopic === t.topic ? ' active' : '');
+  chip.textContent = '#'+t.topic;
+  chip.addEventListener('click', function(){ renderBrowseByTopic(t.topic); });
+  wrap.appendChild(chip);
+});
+}
+
+function buildExploreGrid(list){
+var grid = document.createElement('div'); grid.className = 'fsx-explore-grid';
+list.forEach(function(post){
+  var tile = document.createElement('div'); tile.className = 'fsx-explore-tile';
+  if (post.video){
+    tile.innerHTML = '<video src="'+post.video+'" muted preload="metadata"></video><i class="fas fa-play type-badge"></i>';
+  } else if (post.image){
+    tile.innerHTML = '<img src="'+post.image+'" loading="lazy">';
+  } else if (post.iframe){
+    tile.innerHTML = '<img src="https://ui-avatars.com/api/?name='+encodeURIComponent(post.name)+'&background=1a1a1a&color=fff&size=256" loading="lazy"><i class="fab fa-youtube type-badge"></i>';
+  } else if (post.audio){
+    tile.innerHTML = '<div class="txt-tile"><i class="fas fa-music" style="font-size:1.3rem;margin-bottom:0.3rem;display:block;"></i>'+escapeHtml((post.content||post.topic||'Audio post').slice(0,60))+'</div>';
+  } else {
+    tile.innerHTML = '<div class="txt-tile">'+escapeHtml((post.content||'').slice(0,80) || ('@'+post.username))+'</div>';
+  }
+  tile.addEventListener('click', function(){ if (isVideoEligible(post)) openReelsAt(post.id, 0); else showSharedPostModal(post); });
+  grid.appendChild(tile);
+});
+return grid;
+}
+
+function renderBrowseDefault(){
+currentBrowseTopic = null;
+renderBrowseChips();
+var withMedia = allPosts.filter(function(p){ return p.image || p.video || p.iframe; });
+var withoutMedia = allPosts.filter(function(p){ return !(p.image || p.video || p.iframe); });
+var sample = shuffleArray(withMedia.slice()).slice(0,54).concat(shuffleArray(withoutMedia.slice()).slice(0,6));
+var wrap = $('fsxBrowseResults'); wrap.innerHTML = '';
+if (!sample.length){ wrap.innerHTML = '<div class="fsx-empty-state"><i class="fas fa-compass"></i><h3>Nothing to explore yet</h3></div>'; return; }
+var title = document.createElement('div'); title.className = 'fsx-browse-section-title'; title.textContent = 'Explore';
+wrap.appendChild(title);
+wrap.appendChild(buildExploreGrid(sample));
+}
+
+function renderBrowseByTopic(topic){
+currentBrowseTopic = topic;
+renderBrowseChips(topic);
+var matched = allPosts.filter(function(p){ return p.topic === topic; });
+var wrap = $('fsxBrowseResults'); wrap.innerHTML = '';
+if (!matched.length){ wrap.innerHTML = '<div class="fsx-empty-state"><i class="fas fa-hashtag"></i><h3>No posts with #'+escapeHtml(topic)+'</h3></div>'; return; }
+var title = document.createElement('div'); title.className = 'fsx-browse-section-title'; title.textContent = '#'+topic+' · '+matched.length+' posts';
+wrap.appendChild(title);
+wrap.appendChild(buildExploreGrid(matched.slice(0,90)));
+}
+
+function renderBrowseSearchResults(query){
+var profiles = searchProfiles(query).slice(0,10);
+var topics = searchTopics(query).slice(0,10);
+var posts = searchPostsRaw(query, 48);
+var wrap = $('fsxBrowseResults'); wrap.innerHTML = '';
+$('fsxBrowseChips').innerHTML = '';
+if (!profiles.length && !topics.length && !posts.length){
+  wrap.innerHTML = '<div class="fsx-empty-state"><i class="fas fa-search"></i><h3>No results for "'+escapeHtml(query)+'"</h3></div>';
+  return;
+}
+if (profiles.length){
+  var h1 = document.createElement('div'); h1.className = 'fsx-browse-section-title'; h1.textContent = 'Profiles'; wrap.appendChild(h1);
+  profiles.forEach(function(p){
+    var row = document.createElement('div'); row.className = 'fsx-browse-profile-row';
+    row.innerHTML = '<img src="https://ui-avatars.com/api/?name='+encodeURIComponent(p.name)+'&background=1e3a8a&color=fff"><div><h4>'+escapeHtml(p.name)+'</h4><span>@'+escapeHtml(p.username)+' · '+p.postsCount+' posts</span></div>';
+    row.addEventListener('click', function(){ showUserProfile(p.username, p.name); addToSearchHistory(p.username, p.name, 'profile'); });
+    wrap.appendChild(row);
+  });
+}
+if (topics.length){
+  var h2 = document.createElement('div'); h2.className = 'fsx-browse-section-title'; h2.textContent = 'Topics'; wrap.appendChild(h2);
+  var chipRow = document.createElement('div'); chipRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:0.5rem;';
+  topics.forEach(function(t){
+    var chip = document.createElement('div'); chip.className = 'fsx-chip'; chip.textContent = t.name+' ('+t.postsCount+')';
+    chip.addEventListener('click', function(){ $('fsxBrowseSearchInput').value = ''; renderBrowseByTopic(t.topic); addToSearchHistory(t.topic, t.name, 'topic'); });
+    chipRow.appendChild(chip);
+  });
+  wrap.appendChild(chipRow);
+}
+if (posts.length){
+  var h3 = document.createElement('div'); h3.className = 'fsx-browse-section-title'; h3.textContent = 'Posts';
+  wrap.appendChild(h3);
+  wrap.appendChild(buildExploreGrid(posts));
+}
+}
+
+var runBrowseSearch = debounce(function(query){
+if (!query){ renderBrowseDefault(); return; }
+renderBrowseSearchResults(query);
+}, SEARCH_DEBOUNCE_MS);
+
+$('fsxBrowseSearchInput').addEventListener('input', function(){ runBrowseSearch(this.value.trim().toLowerCase()); });
+
+/* ===================== DATE HELPERS ===================== */
 
 function parseCustomDate(dateString){
 try {
@@ -316,6 +536,8 @@ return months[d.getMonth()]+' '+d.getDate()+' '+d.getFullYear()+' '+h12+':'+mm+a
 
 function formatNum(n){ if (!n) return '0'; if (n>=1000000) return (n/1000000).toFixed(1).replace(/\.0$/,'')+'M'; if (n>=1000) return (n/1000).toFixed(1).replace(/\.0$/,'')+'K'; return n.toString(); }
 function escapeHtml(str){ if (!str) return ''; return String(str).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+/* ===================== LOAD POSTS ===================== */
 
 function fetchGithubPosts(){
 var timeout = new Promise(function(_, reject){ setTimeout(function(){ reject(new Error('timeout')); }, 10000); });
@@ -363,13 +585,22 @@ shuffleArray(allPosts);
 
 videoPosts = DATABASEPOSTS.filter(isVideoEligible);
 
+buildSearchCaches();
 loadTrendingTopics(); loadSuggestedProfiles(); loadMoreFeedPosts();
+if (currentView === 'browse') renderBrowseDefault();
 }
 
 function isVideoEligible(p){
 if (p.video) return true;
 if (p.iframe){ var s=p.iframe.toLowerCase(); return s.includes('youtube.com/embed')||s.includes('youtu.be')||s.includes('vimeo')||s.includes('embed'); }
 return false;
+}
+
+// A video already liked by the current user stays out of the main feed (it's still
+// reachable via search, the profile "Liked" tab, or Browse) so the feed keeps surfacing new content.
+function isFeedEligible(p){
+if (isVideoEligible(p) && currentUser && currentUser.likedPosts && currentUser.likedPosts.has(p.id)) return false;
+return true;
 }
 
 function shuffleArray(arr){ for (var i=arr.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=arr[i]; arr[i]=arr[j]; arr[j]=t; } return arr; }
@@ -382,12 +613,20 @@ entries.forEach(function(entry){ if (entry.isIntersecting && !isLoading && hasMo
 
 if ($('fsxSentinel')) feedObserver.observe($('fsxSentinel'));
 
+function resetHomeFeed(){
+$('fsxPostsFeed').innerHTML = '';
+displayedPosts.clear();
+hasMorePosts = true;
+loadMoreFeedPosts();
+}
+
 function loadMoreFeedPosts(){
 if (isLoading || !hasMorePosts || !allPosts.length) return;
 isLoading = true;
 $('fsxLoadStatus').innerHTML = '<div class="fsx-spinner"></div>Loading more...';
 setTimeout(function(){
-  var toShow = allPosts.filter(function(p){ return !displayedPosts.has(p.id); }).slice(0, POSTS_PER_PAGE);
+  var remaining = allPosts.filter(function(p){ return !displayedPosts.has(p.id) && isFeedEligible(p); });
+  var toShow = remaining.slice(0, POSTS_PER_PAGE);
   if (!toShow.length){
     hasMorePosts = false;
     $('fsxLoadStatus').textContent = allPosts.length ? "You're all caught up" : '';
@@ -396,7 +635,7 @@ setTimeout(function(){
   var frag = document.createDocumentFragment();
   toShow.forEach(function(post){ frag.appendChild(createPostCard(post, post.id)); displayedPosts.add(post.id); });
   $('fsxPostsFeed').appendChild(frag);
-  hasMorePosts = (allPosts.length - displayedPosts.size) > 0;
+  hasMorePosts = (remaining.length - toShow.length) > 0;
   $('fsxLoadStatus').textContent = hasMorePosts ? '' : "You're all caught up";
   isLoading = false;
 }, 200);
@@ -457,12 +696,12 @@ card.innerHTML =
   '</div>' +
   '<div class="fsx-post-content">' + (post.content ? '<p>'+processedContent+'</p>' : '') + '</div>' +
   renderMedia(post, postId) +
-  '<div class="fsx-post-stats"><span>'+(post.likes||0).toLocaleString()+' likes</span></div>' +
   '<div class="fsx-post-actions">' +
-    '<button class="fsx-action-btn'+(isLiked?' liked':'')+'" data-action="like"><i class="fas fa-heart"></i> Like</button>' +
-    '<button class="fsx-action-btn" data-action="share"><i class="fas fa-share-alt"></i> Share</button>' +
-    '<button class="fsx-action-btn report-btn" data-action="report"><i class="fas fa-flag"></i></button>' +
-  '</div>';
+    '<button class="fsx-action-btn'+(isLiked?' liked':'')+'" data-action="like" aria-label="Like"><i class="fas fa-heart"></i></button>' +
+    '<button class="fsx-action-btn" data-action="share" aria-label="Share"><i class="fas fa-paper-plane"></i></button>' +
+    '<button class="fsx-action-btn report-btn" data-action="report" aria-label="Report"><i class="fas fa-ellipsis"></i></button>' +
+  '</div>' +
+  '<div class="fsx-post-stats"><span>'+(post.likes||0).toLocaleString()+' likes</span></div>';
 
 card.querySelector('.fsx-post-user').addEventListener('click', function(){ showUserProfile(post.username, post.name); });
 
@@ -481,12 +720,12 @@ if (videoWrap){
   var videoEl = videoWrap.querySelector('video');
   if (videoEl) {
     feedVideoObserver.observe(videoEl);
-    
+
     var muteBtn = videoWrap.querySelector('[data-action="feed-mute"]');
     if (muteBtn) {
       muteBtn.addEventListener('click', function(e){ e.stopPropagation(); setGlobalMute(!isMuted); });
     }
-    
+
     videoWrap.addEventListener('click', function(){
       lastFeedVideo = videoEl;
       lastFeedTime = videoEl.currentTime || 0;
@@ -508,20 +747,45 @@ if (reelTag){
 return card;
 }
 
+/* ===================== LIKES / AFFINITY (recommendation signals) ===================== */
+
 function handleLike(post, postId, btn){
-if (!currentUser || currentUser.isGuest){ alert('Please login to like posts!'); return; }
+if (!requireAuth('Log in to like posts.')) return;
 if (!currentUser.likedPosts) currentUser.likedPosts = new Set();
 var card = btn.closest('.fsx-post-card');
 var statSpan = card ? card.querySelector('.fsx-post-stats span') : null;
 var liked = currentUser.likedPosts.has(postId);
-if (liked){ currentUser.likedPosts.delete(postId); post.likes = Math.max(0,(post.likes||0)-1); btn.classList.remove('liked'); btn.innerHTML = '<i class="fas fa-heart"></i> Like'; }
-else { currentUser.likedPosts.add(postId); post.likes = (post.likes||0)+1; btn.classList.add('liked'); btn.innerHTML = '<i class="fas fa-heart"></i> Liked'; if (post.topic) bumpAffinity(post.topic, 2); }
+if (liked){
+  currentUser.likedPosts.delete(postId);
+  post.likes = Math.max(0,(post.likes||0)-1);
+  btn.classList.remove('liked');
+} else {
+  currentUser.likedPosts.add(postId);
+  post.likes = (post.likes||0)+1;
+  btn.classList.add('liked');
+  registerLikeSignal(post);
+  // A newly-liked video should disappear from the home feed (still findable via search/profile).
+  if (isVideoEligible(post) && card && card.closest('#fsxPostsFeed')) {
+    setTimeout(function(){ card.style.transition = 'opacity .25s'; card.style.opacity = '0'; setTimeout(function(){ card.remove(); }, 250); }, 300);
+  }
+}
 if (statSpan) statSpan.textContent = (post.likes||0).toLocaleString() + ' likes';
 saveCurrentUser();
 }
 
+// Bumps topic affinity AND "investigates" the creator's account — boosting that
+// account's other/new videos in the recommendation feed, the way a real FYP would.
+function registerLikeSignal(post){
+if (post.topic) bumpAffinity(post.topic, 3);
+bumpAccountAffinity(post.username, 6);
+var creatorPosts = DATABASEPOSTS.filter(function(p){ return p.username === post.username; });
+var topicCounts = {};
+creatorPosts.forEach(function(p){ if (p.topic) topicCounts[p.topic] = (topicCounts[p.topic]||0)+1; });
+Object.keys(topicCounts).forEach(function(t){ bumpAffinity(t, 0.5); });
+}
+
 function filterPostsByTopic(topic){
-setActiveNav('home');
+switchView('home');
 $('fsxPostsFeed').innerHTML = '';
 displayedPosts.clear();
 var filtered = allPosts.filter(function(p){ return p.topic === topic; });
@@ -531,28 +795,17 @@ hasMorePosts = false; $('fsxLoadStatus').textContent = '';
 }
 
 function loadTrendingTopics(){
-var topics = {};
-DATABASEPOSTS.forEach(function(p){ if (p.topic) topics[p.topic] = (topics[p.topic]||0)+1; });
-var sorted = Object.entries(topics).sort(function(a,b){ return b[1]-a[1]; }).slice(0,5);
 var wrap = $('fsxTrendingList'); wrap.innerHTML = '';
-sorted.forEach(function(e){
+topicsCache.slice(0,5).forEach(function(e){
   var d = document.createElement('div'); d.className = 'fsx-trend-item';
-  d.innerHTML = '<div class="name">#'+escapeHtml(e[0])+'</div><div class="count">'+e[1]+' posts</div>';
-  d.addEventListener('click', function(){ filterPostsByTopic(e[0]); });
+  d.innerHTML = '<div class="name">#'+escapeHtml(e.topic)+'</div><div class="count">'+e.postsCount+' posts</div>';
+  d.addEventListener('click', function(){ filterPostsByTopic(e.topic); });
   wrap.appendChild(d);
 });
 }
 
 function loadSuggestedProfiles(){
-var seen = new Map();
-DATABASEPOSTS.forEach(function(post){
-  if (!seen.has(post.username)){
-    var userPosts = DATABASEPOSTS.filter(function(p){ return p.username === post.username; });
-    var totalLikes = userPosts.reduce(function(s,p){ return s+(p.likes||0); }, 0);
-    seen.set(post.username, { name:post.name, username:post.username, postsCount:userPosts.length, totalLikes:totalLikes });
-  }
-});
-var top = Array.from(seen.values()).sort(function(a,b){ return b.totalLikes-a.totalLikes; }).slice(0,5);
+var top = profilesCache.slice().sort(function(a,b){ return b.totalLikes-a.totalLikes; }).slice(0,5);
 var wrap = $('fsxSuggestedProfiles'); wrap.innerHTML = '';
 top.forEach(function(u){
   var d = document.createElement('div'); d.className = 'fsx-profile-item';
@@ -562,7 +815,7 @@ top.forEach(function(u){
 });
 }
 
-function showOwnProfile(){ if (!currentUser || currentUser.isGuest){ alert('Please login to view your profile!'); return; } showUserProfile(currentUser.username, currentUser.name, true); }
+function showOwnProfile(){ if (!requireAuth('Log in to view and manage your profile.')) return; showUserProfile(currentUser.username, currentUser.name, true); }
 function getMentionsForUser(username){ return DATABASEPOSTS.filter(function(post){ return post.content && post.content.indexOf('@'+username) > -1; }); }
 
 function showUserProfile(username, name, isOwn){
@@ -679,6 +932,7 @@ btn.addEventListener('click', function(){
 });
 
 function openReportModal(post){
+if (!requireAuth('Log in to report a post.')) return;
 reportTargetPost = post;
 $('fsxReportNote').value = '';
 document.querySelectorAll('input[name="fsxReportReason"]').forEach(function(r){ r.checked = false; });
@@ -740,12 +994,12 @@ $('fsxCPContent').value = ''; $('fsxCPUrl').value = ''; $('fsxCPUrl').disabled =
 updateCPPreview();
 }
 
-$('fsxCreateTrigger').addEventListener('click', function(){ if (!currentUser || currentUser.isGuest){ alert('Please login to post!'); return; } resetCreatePost(); $('fsxCreatePostOverlay').classList.add('active'); });
+$('fsxCreateTrigger').addEventListener('click', function(){ if (!requireAuth('Log in to create a post.')) return; resetCreatePost(); $('fsxCreatePostOverlay').classList.add('active'); });
 $('fsxCloseCreatePost').addEventListener('click', function(){ $('fsxCreatePostOverlay').classList.remove('active'); });
 $('fsxCreatePostOverlay').addEventListener('click', function(e){ if (e.target === this) this.classList.remove('active'); });
 
 $('fsxCPSubmit').addEventListener('click', function(){
-if (!currentUser || currentUser.isGuest){ alert('Please login to post!'); return; }
+if (!requireAuth('Log in to create a post.')) return;
 var content = $('fsxCPContent').value.trim();
 var url = $('fsxCPUrl').value.trim();
 var topic = $('fsxCPTopic').value.trim();
@@ -762,6 +1016,7 @@ newPost.id = 'sb-' + Date.now().toString(36) + Math.random().toString(36).slice(
 DATABASEPOSTS.unshift(newPost);
 allPosts.unshift(newPost);
 if (isVideoEligible(newPost)) videoPosts.unshift(newPost);
+addPostToCaches(newPost);
 
 $('fsxPostsFeed').prepend(createPostCard(newPost, newPost.id));
 displayedPosts.add(newPost.id);
@@ -771,10 +1026,16 @@ insertPostToSupabase(newPost);
 $('fsxCreatePostOverlay').classList.remove('active');
 });
 
+/* ===================== RECOMMENDATION ENGINE ===================== */
+
 function affinityKey(){ return 'fsx-affinity-' + ((currentUser && currentUser.username) || 'guest'); }
+function accountAffinityKey(){ return 'fsx-account-affinity-' + ((currentUser && currentUser.username) || 'guest'); }
 function loadAffinity(){ try { return JSON.parse(localStorage.getItem(affinityKey())) || {}; } catch(e){ return {}; } }
 function saveAffinity(map){ try { localStorage.setItem(affinityKey(), JSON.stringify(map)); } catch(e){} }
 function bumpAffinity(topic, amount){ if (!topic) return; var map = loadAffinity(); map[topic] = (map[topic]||0) + amount; saveAffinity(map); }
+function loadAccountAffinity(){ try { return JSON.parse(localStorage.getItem(accountAffinityKey())) || {}; } catch(e){ return {}; } }
+function saveAccountAffinity(map){ try { localStorage.setItem(accountAffinityKey(), JSON.stringify(map)); } catch(e){} }
+function bumpAccountAffinity(username, amount){ if (!username) return; var map = loadAccountAffinity(); map[username] = (map[username]||0) + amount; saveAccountAffinity(map); }
 
 function recordWatchProgress(post, ratio){
 if (!post || ratio < 0.7 || watchedThisSession.has(post.id)) return;
@@ -782,22 +1043,54 @@ watchedThisSession.add(post.id);
 if (post.topic) bumpAffinity(post.topic, 1);
 }
 
+// Remembers what's already been shown this session so the FYP doesn't loop the
+// same clips; once most of the pool has been surfaced, it recycles the memory.
+function markVideoShown(id){
+recentlyShownVideos.add(id);
+if (recentlyShownVideos.size >= Math.max(6, videoPosts.length - 1)) recentlyShownVideos.clear();
+}
+
+// Keeps consecutive clips from the same creator/topic from clumping together,
+// so liking one account still surfaces a healthy mix rather than a wall of one person.
+function diversifyOrder(list){
+var result = list.slice();
+for (var i=1; i<result.length; i++){
+  if (result[i].username === result[i-1].username){
+    for (var j=i+1; j<Math.min(result.length, i+6); j++){
+      if (result[j].username !== result[i-1].username){
+        var tmp = result[i]; result[i] = result[j]; result[j] = tmp;
+        break;
+      }
+    }
+  }
+}
+return result;
+}
+
 function orderVideosByRecommendation(list){
 var affinity = loadAffinity();
-var likedTopics = {};
+var accountAff = loadAccountAffinity();
+var likedTopics = {}, likedAccounts = {};
 if (currentUser && currentUser.likedPosts){
   currentUser.likedPosts.forEach(function(id){
     var p = DATABASEPOSTS.find(function(x){ return x.id === id; });
-    if (p && p.topic) likedTopics[p.topic] = (likedTopics[p.topic]||0) + 2;
+    if (p){
+      if (p.topic) likedTopics[p.topic] = (likedTopics[p.topic]||0) + 2;
+      likedAccounts[p.username] = (likedAccounts[p.username]||0) + 3;
+    }
   });
 }
-return list.map(function(post){
-  var score = Math.random() * 1.5;
-  if (post.topic){ score += (affinity[post.topic]||0) * 1.2; score += (likedTopics[post.topic]||0); }
-  if (watchedThisSession.has(post.id)) score -= 4;
-  score += Math.log((post.likes||0)+1) * 0.25;
+var scored = list.map(function(post){
+  var score = Math.random() * 1.2;
+  if (post.topic){ score += (affinity[post.topic]||0) * 1.1; score += (likedTopics[post.topic]||0); }
+  score += (accountAff[post.username]||0) * 1.3;
+  score += (likedAccounts[post.username]||0);
+  if (recentlyShownVideos.has(post.id)) score -= 6;      // avoid immediate repeats
+  if (watchedThisSession.has(post.id)) score -= 3;
+  score += Math.log((post.likes||0)+1) * 0.2;
   return { post: post, score: score };
 }).sort(function(a,b){ return b.score - a.score; }).map(function(x){ return x.post; });
+return diversifyOrder(scored);
 }
 
 function openReels(){
@@ -814,10 +1107,11 @@ launchReels([clicked].concat(rest), resumeTime || 0);
 }
 
 function launchReels(list, resumeTime){
+switchView('videos'); // keeps nav highlighting consistent
 setActiveNav('videos');
 $('fsxReelsView').classList.add('active');
 document.body.style.overflow = 'hidden';
-document.querySelectorAll('.fsx-feed-video-wrap video').forEach(function(v){ 
+document.querySelectorAll('.fsx-feed-video-wrap video').forEach(function(v){
   v.pause();
   v.muted = isMuted;
 });
@@ -827,10 +1121,10 @@ renderReelsFeed(list, resumeTime);
 function closeReels(){
 $('fsxReelsView').classList.remove('active');
 document.body.style.overflow = '';
-document.querySelectorAll('.fsx-reel-media-wrap video').forEach(function(v){ 
-  v.pause(); 
+document.querySelectorAll('.fsx-reel-media-wrap video').forEach(function(v){
+  v.pause();
 });
-setActiveNav('home');
+switchView('home');
 
 if(lastFeedVideo){
   lastFeedVideo.currentTime = lastFeedTime;
@@ -856,7 +1150,7 @@ if (!activeReelList.length){
   feed.innerHTML = '<div class="fsx-reel-empty"><i class="fas fa-film" style="font-size:2.4rem;opacity:0.5;"></i><h3 style="color:#fff;">No videos yet</h3><p>Check back later for new video posts.</p></div>';
   return;
 }
-var limit = Math.min(4, activeReelList.length);
+var limit = Math.min(5, activeReelList.length);
 for (var i=0; i<limit; i++) renderReelCard(i);
 setupReelObserver();
 if (resumeTime){
@@ -905,8 +1199,8 @@ card.innerHTML =
   '</div>' +
   '<div class="fsx-reel-actions">' +
     '<div class="fsx-reel-action'+(isLiked?' liked':'')+'" data-action="like"><div class="circle"><i class="fas fa-heart"></i></div><span class="lbl">'+formatNum(post.likes)+'</span></div>' +
-    '<div class="fsx-reel-action" data-action="share"><div class="circle"><i class="fas fa-share-alt"></i></div><span class="lbl">Share</span></div>' +
-    '<div class="fsx-reel-action" data-action="report"><div class="circle"><i class="fas fa-flag"></i></div><span class="lbl">Report</span></div>' +
+    '<div class="fsx-reel-action" data-action="share"><div class="circle"><i class="fas fa-paper-plane"></i></div><span class="lbl">Share</span></div>' +
+    '<div class="fsx-reel-action" data-action="report"><div class="circle"><i class="fas fa-ellipsis"></i></div><span class="lbl">Report</span></div>' +
     '<div class="fsx-reel-action" data-action="profile"><div class="circle"><i class="fas fa-user"></i></div><span class="lbl">Profile</span></div>' +
   '</div>' +
   '<div class="fsx-reel-progress"><div class="fsx-reel-progress-fill" id="fsxReelProg'+index+'"></div></div>';
@@ -960,20 +1254,18 @@ if (!currentUser || !currentUser.likedPosts || !currentUser.likedPosts.has(post.
 }
 
 function handleReelLike(post, likeEl){
-if (!currentUser || currentUser.isGuest){ showReelToast('Login to like videos!'); return; }
+if (!requireAuth('Log in to like videos.')) return;
 if (!currentUser.likedPosts) currentUser.likedPosts = new Set();
 var liked = currentUser.likedPosts.has(post.id);
 var countEl = likeEl.querySelector('.lbl');
-if (liked){ currentUser.likedPosts.delete(post.id); post.likes = Math.max(0,(post.likes||0)-1); likeEl.classList.remove('liked'); }
-else { currentUser.likedPosts.add(post.id); post.likes = (post.likes||0)+1; likeEl.classList.add('liked'); if (post.topic) bumpAffinity(post.topic, 2); }
+if (liked){
+  currentUser.likedPosts.delete(post.id); post.likes = Math.max(0,(post.likes||0)-1); likeEl.classList.remove('liked');
+} else {
+  currentUser.likedPosts.add(post.id); post.likes = (post.likes||0)+1; likeEl.classList.add('liked');
+  registerLikeSignal(post);
+}
 if (countEl) countEl.textContent = formatNum(post.likes);
 saveCurrentUser();
-}
-
-function showReelToast(msg){
-var t = document.createElement('div'); t.textContent = msg;
-t.style.cssText = 'position:fixed;bottom:90px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.85);color:#fff;padding:10px 18px;border-radius:50px;font-size:0.82rem;z-index:999;';
-document.body.appendChild(t); setTimeout(function(){ t.remove(); }, 2200);
 }
 
 function setupReelObserver(){
@@ -985,8 +1277,10 @@ reelObserver = new IntersectionObserver(function(entries){
     var vid = $('fsxReelVid' + index);
     if (entry.isIntersecting && entry.intersectionRatio >= 0.7){
       currentReelIndex = index;
+      if (activeReelList[index]) markVideoShown(activeReelList[index].id);
       if (vid){
         vid.muted = isMuted;
+        vid.preload = 'auto';
         vid.play().catch(function(){});
         vid.ontimeupdate = function(){
           var prog = $('fsxReelProg' + index);
@@ -997,12 +1291,14 @@ reelObserver = new IntersectionObserver(function(entries){
         var iframe = $('fsxReelIframe' + index);
         if (iframe && !iframe.src) iframe.src = iframe.dataset.src.replace('autoplay=0','autoplay=1');
       }
-      for (var ahead=1; ahead<=3; ahead++){
+      // Pre-buffer the next couple of clips so scrolling forward never stalls;
+      // the ones further out only fetch metadata to save bandwidth.
+      for (var ahead=1; ahead<=4; ahead++){
         var ni = index+ahead;
         if (ni < activeReelList.length && !reelRenderedIdx.has(ni)) renderReelCard(ni);
+        var nvid = $('fsxReelVid' + ni);
+        if (nvid) nvid.preload = ahead <= 2 ? 'auto' : 'metadata';
       }
-      var nextVid = $('fsxReelVid' + (index+1));
-      if (nextVid) nextVid.preload = 'auto';
       document.querySelectorAll('.fsx-reel-card').forEach(function(c){ reelObserver.observe(c); });
     } else {
       if (vid && !vid.paused) vid.pause();
@@ -1010,7 +1306,7 @@ reelObserver = new IntersectionObserver(function(entries){
       if (iframeOff) iframeOff.src = '';
     }
   });
-}, { threshold: 0.7, rootMargin: '100% 0px' });
+}, { threshold: 0.7, rootMargin: '150% 0px' });
 document.querySelectorAll('.fsx-reel-card').forEach(function(c){ reelObserver.observe(c); });
 }
 
